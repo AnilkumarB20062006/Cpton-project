@@ -1,0 +1,964 @@
+"""
+ZEpto Analytics Pipeline
+========================
+
+Module 2 — Analytics Pipeline
+
+Complete end-to-end workflow:
+1. Load Titanic dataset exactly once
+2. Profile and clean data
+3. Save offline titanic.csv
+4. Exploratory Data Analysis
+5. Outlier analysis
+6. Bivariate analysis
+7. Correlation analysis
+8. Multivariate data story
+9. Exploratory standardization check
+10. Stratified train/test split
+11. Leakage-safe preprocessing
+12. Logistic Regression
+13. Decision Tree
+14. Random Forest
+15. Imbalance comparison
+16. Random Forest GridSearchCV + OOB
+17. Fare regression
+18. Final model comparison
+19. Save complete pipeline
+20. Reload pipeline and test raw input
+
+Run:
+    python analytics.py
+"""
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
+import os
+import warnings
+import joblib
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import (
+    StandardScaler,
+    OneHotEncoder
+)
+from sklearn.impute import SimpleImputer
+
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.ensemble import RandomForestClassifier
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    roc_curve,
+    roc_auc_score,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score
+)
+
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+RANDOM_STATE = 42
+TEST_SIZE = 0.20
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CHART_DIR = os.path.join(BASE_DIR, "charts")
+os.makedirs(CHART_DIR, exist_ok=True)
+
+CSV_PATH = os.path.join(BASE_DIR, "titanic.csv")
+PIPELINE_PATH = os.path.join(
+    BASE_DIR,
+    "best_titanic_pipeline.joblib"
+)
+
+README_PATH = os.path.join(
+    BASE_DIR,
+    "README.md"
+)
+
+sns.set_theme(style="whitegrid")
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def save_chart(filename):
+    """
+    Save the current matplotlib figure.
+    """
+    path = os.path.join(CHART_DIR, filename)
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def calculate_iqr_outliers(series):
+    """
+    Calculate the number of IQR-based outliers.
+    """
+    q1 = series.quantile(0.25)
+    q3 = series.quantile(0.75)
+
+    iqr = q3 - q1
+
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+
+    mask = (series < lower) | (series > upper)
+
+    return int(mask.sum()), q1, q3, lower, upper
+
+
+def calculate_adjusted_r2(r2, n, p):
+    """
+    Calculate Adjusted R².
+
+    n = number of observations
+    p = number of predictors
+    """
+    if n - p - 1 <= 0:
+        return np.nan
+
+    return 1 - ((1 - r2) * (n - 1) / (n - p - 1))
+
+
+def classification_metrics(y_true, y_pred, y_prob):
+    """
+    Return standard classification metrics.
+    """
+
+    return {
+        "Accuracy": accuracy_score(y_true, y_pred),
+        "Precision": precision_score(
+            y_true,
+            y_pred,
+            zero_division=0
+        ),
+        "Recall": recall_score(
+            y_true,
+            y_pred,
+            zero_division=0
+        ),
+        "F1": f1_score(
+            y_true,
+            y_pred,
+            zero_division=0
+        ),
+        "AUC": roc_auc_score(
+            y_true,
+            y_prob
+        )
+    }
+
+
+# ============================================================
+# PART A
+# LOAD DATASET EXACTLY ONCE
+# ============================================================
+
+print("\n" + "=" * 80)
+print("PART A — DATA LOADING AND PROFILING")
+print("=" * 80)
+
+print("\nLoading Titanic dataset...")
+
+# ============================================================
+# IMPORTANT:
+# THIS IS THE ONLY sns.load_dataset("titanic") CALL
+# ============================================================
+
+df = sns.load_dataset("titanic")
+
+print("\nDataset loaded successfully.")
+
+
+# ============================================================
+# SAVE RAW DATASET IMMEDIATELY
+# ============================================================
+
+df.to_csv(CSV_PATH, index=False)
+
+print(f"\nOffline fallback saved to:")
+print(CSV_PATH)
+
+
+# ============================================================
+# BASIC PROFILE
+# ============================================================
+
+print("\n" + "-" * 80)
+print("DATAFRAME INFO")
+print("-" * 80)
+
+df.info()
+
+print("\n" + "-" * 80)
+print("DESCRIPTIVE STATISTICS")
+print("-" * 80)
+
+print(df.describe(include="all"))
+
+print("\n" + "-" * 80)
+print("DATASET SHAPE")
+print("-" * 80)
+
+print(df.shape)
+
+
+# ============================================================
+# MISSING VALUE ANALYSIS
+# ============================================================
+
+missing_percentage = (
+    df.isnull()
+    .mean()
+    .mul(100)
+    .sort_values(ascending=False)
+)
+
+missing_percentage = missing_percentage[
+    missing_percentage > 0
+]
+
+print("\n" + "-" * 80)
+print("MISSING VALUE PERCENTAGES")
+print("-" * 80)
+
+print(
+    missing_percentage
+    .to_string()
+)
+
+
+# ============================================================
+# CLEANING STRATEGY
+# ============================================================
+
+print("\n" + "=" * 80)
+print("MISSING VALUE HANDLING")
+print("=" * 80)
+
+clean_df = df.copy()
+
+cleaning_notes = []
+
+for column in df.columns:
+
+    missing_rate = df[column].isna().mean() * 100
+
+    if missing_rate == 0:
+        continue
+
+    # --------------------------------------------------------
+    # Under 5% → drop rows
+    # --------------------------------------------------------
+
+    if missing_rate < 5:
+
+        before = len(clean_df)
+
+        clean_df = clean_df.dropna(
+            subset=[column]
+        )
+
+        removed = before - len(clean_df)
+
+        note = (
+            f"{column}: {missing_rate:.2f}% missing. "
+            f"Below 5%, therefore rows containing missing "
+            f"values were dropped. Rows removed: {removed}."
+        )
+
+        cleaning_notes.append(note)
+
+        print(note)
+
+    # --------------------------------------------------------
+    # 5%–30% → impute
+    # --------------------------------------------------------
+
+    elif missing_rate <= 30:
+
+        if pd.api.types.is_numeric_dtype(
+            clean_df[column]
+        ):
+
+            value = clean_df[column].median()
+
+            clean_df[column] = clean_df[
+                column
+            ].fillna(value)
+
+            note = (
+                f"{column}: {missing_rate:.2f}% missing. "
+                f"Between 5% and 30%, therefore median "
+                f"imputation was applied."
+            )
+
+        else:
+
+            value = clean_df[column].mode()[0]
+
+            clean_df[column] = clean_df[
+                column
+            ].fillna(value)
+
+            note = (
+                f"{column}: {missing_rate:.2f}% missing. "
+                f"Between 5% and 30%, therefore mode "
+                f"imputation was applied."
+            )
+
+        cleaning_notes.append(note)
+
+        print(note)
+
+    # --------------------------------------------------------
+    # More than 30%
+    # --------------------------------------------------------
+
+    else:
+
+        # For the Titanic dataset, deck falls into this group.
+        # Instead of unreliable imputation, encode missing
+        # as an explicit category.
+
+        clean_df[column] = (
+            clean_df[column]
+            .astype("object")
+            .fillna("Missing")
+        )
+
+        note = (
+            f"{column}: {missing_rate:.2f}% missing. "
+            f"Above 30%, so conventional imputation would "
+            f"be unreliable. Missing values were encoded as "
+            f"a separate 'Missing' category."
+        )
+
+        cleaning_notes.append(note)
+
+        print(note)
+
+
+# ============================================================
+# ENSURE TARGET IS VALID
+# ============================================================
+
+clean_df = clean_df.dropna(
+    subset=["survived"]
+)
+
+print("\nCleaned dataset shape:")
+print(clean_df.shape)
+
+
+# ============================================================
+# SAVE CLEANED DATA
+# ============================================================
+
+clean_df.to_csv(
+    CSV_PATH,
+    index=False
+)
+
+print(
+    f"\nCleaned Titanic dataset saved to:\n{CSV_PATH}"
+)
+
+
+# ============================================================
+# PART A — UNIVARIATE ANALYSIS
+# ============================================================
+
+print("\n" + "=" * 80)
+print("UNIVARIATE ANALYSIS")
+print("=" * 80)
+
+
+# ============================================================
+# AGE HISTOGRAM
+# ============================================================
+
+plt.figure(figsize=(9, 6))
+
+sns.histplot(
+    clean_df["age"],
+    kde=True,
+    bins=30
+)
+
+plt.title("Age Distribution")
+plt.xlabel("Age")
+plt.ylabel("Frequency")
+
+save_chart("01_age_histogram.png")
+
+
+# ============================================================
+# AGE BOXPLOT
+# ============================================================
+
+plt.figure(figsize=(9, 5))
+
+sns.boxplot(
+    x=clean_df["age"]
+)
+
+plt.title("Age Box Plot")
+plt.xlabel("Age")
+
+save_chart("02_age_boxplot.png")
+
+
+# ============================================================
+# FARE HISTOGRAM
+# ============================================================
+
+plt.figure(figsize=(9, 6))
+
+sns.histplot(
+    clean_df["fare"],
+    kde=True,
+    bins=30
+)
+
+plt.title("Fare Distribution")
+plt.xlabel("Fare")
+plt.ylabel("Frequency")
+
+save_chart("03_fare_histogram.png")
+
+
+# ============================================================
+# FARE BOXPLOT
+# ============================================================
+
+plt.figure(figsize=(9, 5))
+
+sns.boxplot(
+    x=clean_df["fare"]
+)
+
+plt.title("Fare Box Plot")
+plt.xlabel("Fare")
+
+save_chart("04_fare_boxplot.png")
+
+
+# ============================================================
+# IQR OUTLIER ANALYSIS
+# ============================================================
+
+age_outliers, age_q1, age_q3, age_lower, age_upper = (
+    calculate_iqr_outliers(
+        clean_df["age"].dropna()
+    )
+)
+
+fare_outliers, fare_q1, fare_q3, fare_lower, fare_upper = (
+    calculate_iqr_outliers(
+        clean_df["fare"].dropna()
+    )
+)
+
+print("\nIQR OUTLIERS")
+
+print(
+    f"Age outliers: {age_outliers}"
+)
+
+print(
+    f"Age bounds: "
+    f"[{age_lower:.2f}, {age_upper:.2f}]"
+)
+
+print(
+    f"Fare outliers: {fare_outliers}"
+)
+
+print(
+    f"Fare bounds: "
+    f"[{fare_lower:.2f}, {fare_upper:.2f}]"
+)
+
+
+# ============================================================
+# FARE MEAN MEDIAN MODE
+# ============================================================
+
+fare_mean = clean_df["fare"].mean()
+fare_median = clean_df["fare"].median()
+
+fare_mode_values = clean_df["fare"].mode()
+
+fare_mode = (
+    fare_mode_values.iloc[0]
+    if len(fare_mode_values) > 0
+    else np.nan
+)
+
+print("\nFare statistics:")
+
+print(
+    f"Mean   : {fare_mean:.4f}"
+)
+
+print(
+    f"Median : {fare_median:.4f}"
+)
+
+print(
+    f"Mode   : {fare_mode:.4f}"
+)
+
+
+if fare_mean > fare_median > fare_mode:
+
+    fare_skew_interpretation = (
+        "Fare is right-skewed because the mean is "
+        "greater than the median, which is greater "
+        "than the mode."
+    )
+
+elif fare_mean < fare_median < fare_mode:
+
+    fare_skew_interpretation = (
+        "Fare is left-skewed because the mean is "
+        "less than the median, which is less "
+        "than the mode."
+    )
+
+else:
+
+    fare_skew_interpretation = (
+        "Fare does not follow a simple mean > median > mode "
+        "or mean < median < mode ordering; therefore the "
+        "distribution is not classified solely from that "
+        "ordering."
+    )
+
+print("\nSkewness interpretation:")
+print(fare_skew_interpretation)
+
+
+# ============================================================
+# PART A — BIVARIATE ANALYSIS
+# ============================================================
+
+print("\n" + "=" * 80)
+print("BIVARIATE ANALYSIS")
+print("=" * 80)
+
+
+# ============================================================
+# SURVIVAL BY SEX
+# ============================================================
+
+sex_survival = (
+    clean_df
+    .groupby("sex")["survived"]
+    .mean()
+    .mul(100)
+)
+
+print("\nSurvival rate by sex:")
+print(sex_survival)
+
+
+# Boolean masking explicitly
+male_mask = clean_df["sex"] == "male"
+female_mask = clean_df["sex"] == "female"
+
+male_survival = (
+    clean_df.loc[male_mask, "survived"]
+    .mean() * 100
+)
+
+female_survival = (
+    clean_df.loc[female_mask, "survived"]
+    .mean() * 100
+)
+
+print(
+    f"\nMale survival rate: {male_survival:.2f}%"
+)
+
+print(
+    f"Female survival rate: {female_survival:.2f}%"
+)
+
+
+# ============================================================
+# SURVIVAL BY PCLASS
+# ============================================================
+
+pclass_survival = (
+    clean_df
+    .groupby("pclass")["survived"]
+    .mean()
+    .mul(100)
+)
+
+print("\nSurvival rate by passenger class:")
+print(pclass_survival)
+
+
+# ============================================================
+# SEX + PCLASS
+# ============================================================
+
+sex_pclass_survival = (
+    clean_df
+    .groupby(["sex", "pclass"])["survived"]
+    .mean()
+    .mul(100)
+)
+
+print("\nSurvival rate by sex and passenger class:")
+print(sex_pclass_survival)
+
+
+# Explicit boolean combinations
+female_first = (
+    clean_df[
+        (clean_df["sex"] == "female")
+        & (clean_df["pclass"] == 1)
+    ]["survived"]
+    .mean()
+    * 100
+)
+
+male_third = (
+    clean_df[
+        (clean_df["sex"] == "male")
+        & (clean_df["pclass"] == 3)
+    ]["survived"]
+    .mean()
+    * 100
+)
+
+print(
+    f"\nFemale + First Class survival: "
+    f"{female_first:.2f}%"
+)
+
+print(
+    f"Male + Third Class survival: "
+    f"{male_third:.2f}%"
+)
+
+
+# ============================================================
+# CORRELATION MATRIX
+# EXACTLY SIX REQUIRED COLUMNS
+# ============================================================
+
+correlation_columns = [
+    "survived",
+    "pclass",
+    "age",
+    "sibsp",
+    "parch",
+    "fare"
+]
+
+corr_matrix = clean_df[
+    correlation_columns
+].corr()
+
+print("\nCorrelation matrix:")
+print(corr_matrix)
+
+
+# ============================================================
+# CORRELATION HEATMAP
+# ============================================================
+
+plt.figure(figsize=(9, 7))
+
+sns.heatmap(
+    corr_matrix,
+    annot=True,
+    fmt=".2f",
+    cmap="coolwarm",
+    center=0,
+    square=True
+)
+
+plt.title(
+    "Titanic Correlation Matrix — Required Six Columns"
+)
+
+save_chart("05_correlation_heatmap.png")
+
+
+# ============================================================
+# TOP TWO ABSOLUTE CORRELATIONS
+# ============================================================
+
+pairs = []
+
+for i in range(len(correlation_columns)):
+
+    for j in range(i + 1, len(correlation_columns)):
+
+        feature_a = correlation_columns[i]
+        feature_b = correlation_columns[j]
+
+        value = corr_matrix.loc[
+            feature_a,
+            feature_b
+        ]
+
+        pairs.append(
+            (
+                feature_a,
+                feature_b,
+                value,
+                abs(value)
+            )
+        )
+
+pairs.sort(
+    key=lambda x: x[3],
+    reverse=True
+)
+
+top_two_correlations = pairs[:2]
+
+print("\nTop two strongest correlations:")
+
+for rank, (
+    feature_a,
+    feature_b,
+    value,
+    absolute_value
+) in enumerate(
+    top_two_correlations,
+    start=1
+):
+
+    print(
+        f"{rank}. {feature_a} ↔ {feature_b}: "
+        f"{value:.4f} "
+        f"(absolute = {absolute_value:.4f})"
+    )
+
+
+# ============================================================
+# MULTIVARIATE DATA STORY
+# ============================================================
+
+print("\n" + "=" * 80)
+print("MULTIVARIATE DATA STORY")
+print("=" * 80)
+
+
+# ============================================================
+# CHART 1 — SURVIVAL BY SEX
+# ============================================================
+
+plt.figure(figsize=(8, 6))
+
+sns.barplot(
+    data=clean_df,
+    x="sex",
+    y="survived"
+)
+
+plt.title("Survival Rate by Sex")
+plt.ylabel("Survival Rate")
+plt.xlabel("Sex")
+
+save_chart("06_survival_by_sex.png")
+
+
+# ============================================================
+# CHART 2 — SURVIVAL BY PCLASS AND SEX
+# ============================================================
+
+plt.figure(figsize=(9, 6))
+
+sns.barplot(
+    data=clean_df,
+    x="pclass",
+    y="survived",
+    hue="sex"
+)
+
+plt.title(
+    "Survival Rate by Passenger Class and Sex"
+)
+
+plt.ylabel("Survival Rate")
+plt.xlabel("Passenger Class")
+
+save_chart("07_survival_by_class_and_sex.png")
+
+
+# ============================================================
+# CHART 3 — AGE VS FARE
+# ============================================================
+
+plt.figure(figsize=(9, 6))
+
+sns.scatterplot(
+    data=clean_df,
+    x="age",
+    y="fare",
+    hue="survived",
+    alpha=0.7
+)
+
+plt.title(
+    "Age vs Fare Colored by Survival"
+)
+
+plt.xlabel("Age")
+plt.ylabel("Fare")
+
+save_chart("08_age_fare_survival_scatter.png")
+
+
+# ============================================================
+# CHART 4 — AGE DISTRIBUTION BY SURVIVAL
+# ============================================================
+
+plt.figure(figsize=(9, 6))
+
+sns.boxplot(
+    data=clean_df,
+    x="survived",
+    y="age"
+)
+
+plt.title(
+    "Age Distribution by Survival"
+)
+
+plt.xlabel("Survived")
+plt.ylabel("Age")
+
+save_chart("09_age_by_survival.png")
+
+
+# ============================================================
+# CHART 5 — FARE BY CLASS AND SURVIVAL
+# ============================================================
+
+plt.figure(figsize=(10, 6))
+
+sns.boxplot(
+    data=clean_df,
+    x="pclass",
+    y="fare",
+    hue="survived"
+)
+
+plt.title(
+    "Fare by Passenger Class and Survival"
+)
+
+plt.xlabel("Passenger Class")
+plt.ylabel("Fare")
+
+save_chart("10_fare_class_survival.png")
+
+
+# ============================================================
+# STANDARDIZATION SANITY CHECK
+# ============================================================
+
+print("\n" + "=" * 80)
+print("EDA STANDARDIZATION CHECK")
+print("=" * 80)
+
+standardized_df = clean_df.copy()
+
+age_mean_before = standardized_df["age"].mean()
+age_std_before = standardized_df["age"].std()
+
+fare_mean_before = standardized_df["fare"].mean()
+fare_std_before = standardized_df["fare"].std()
+
+
+standardized_df["age"] = (
+    standardized_df["age"]
+    - age_mean_before
+) / age_std_before
+
+standardized_df["fare"] = (
+    standardized_df["fare"]
+    - fare_mean_before
+) / fare_std_before
+
+
+print("\nBEFORE STANDARDIZATION")
+
+print(
+    f"Age  mean = {age_mean_before:.6f}, "
+    f"std = {age_std_before:.6f}"
+)
+
+print(
+    f"Fare mean = {fare_mean_before:.6f}, "
+    f"std = {fare_std_before:.6f}"
+)
+
+
+print("\nAFTER STANDARDIZATION")
+
+print(
+    f"Age  mean = {standardized_df['age'].mean():.6f}, "
+    f"std = {standardized_df['age'].std():.6f}"
+)
+
+print(
+    f"Fare mean = {standardized_df['fare'].mean():.6f}, "
+    f"std = {standardized_df['fare'].std():.6f}"
+)
+
+
+# ============================================================
+# PART B — MODELING
+# ============================================================
+
+print("\n" + "=" * 80)
+print("PART B — PREDICTIVE MODELING")
+print("=" * 80)
+
+
+# ============================================================
+# MODELING DATA
+# ============================================================
+
+model_df = pd.read_csv(
+    CSV_PATH
+)
+
+# Remove columns that are not appropriate predictors.
+#
+# alive directly duplicates survived.
+# deck has very hig
