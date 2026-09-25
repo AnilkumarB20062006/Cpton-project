@@ -1,0 +1,922 @@
+﻿# Cpton-project
+"""
+============================================================
+ZEpto DATA & AI PLATFORM
+MODULE 1 — DATA PIPELINE
+============================================================
+
+Pipeline:
+    Scrape
+       ↓
+    Clean
+       ↓
+    Convert GBP → INR
+       ↓
+    Normalize
+       ↓
+    SQLite Database
+       ↓
+    SQL Queries
+       ↓
+    pandas.read_sql()
+       ↓
+    pandas.merge()
+
+Data Source:
+    https://books.toscrape.com/
+
+Required fixed conversion rate:
+    1 GBP = 105.50 INR
+
+No API key required.
+"""
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
+import sqlite3
+import time
+from pathlib import Path
+
+import requests
+import pandas as pd
+
+from bs4 import BeautifulSoup
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_URL = "https://books.toscrape.com/"
+
+# Project-defined fixed exchange rate.
+# DO NOT replace this with a live exchange rate.
+GBP_TO_INR = 105.50
+
+# Scrape at least 3 categories.
+TARGET_CATEGORY_COUNT = 3
+
+# We need >= 60 books.
+MINIMUM_BOOKS_REQUIRED = 60
+
+# Number of books to collect per category.
+BOOKS_PER_CATEGORY = 20
+
+# Request timeout.
+REQUEST_TIMEOUT = 15
+
+# Small delay between requests.
+REQUEST_DELAY = 0.2
+
+# Output directory.
+BASE_DIR = Path(__file__).resolve().parent
+
+DATABASE_PATH = BASE_DIR / "books.db"
+SQL_OUTPUT_PATH = BASE_DIR / "sql_outputs.txt"
+PANDAS_SQL_OUTPUT_PATH = BASE_DIR / "pandas_sql_results.csv"
+PANDAS_MERGE_OUTPUT_PATH = BASE_DIR / "pandas_merge_results.csv"
+README_PATH = BASE_DIR / "README.md"
+
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
+
+session = requests.Session()
+
+session.headers.update(
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/131.0 Safari/537.36"
+        )
+    }
+)
+
+
+# ============================================================
+# HELPER: FETCH PAGE
+# ============================================================
+
+def fetch_page(url: str) -> BeautifulSoup:
+    """
+    Download a webpage and return a BeautifulSoup object.
+
+    Raises an exception for HTTP errors so that scraping
+    failures are visible instead of silently ignored.
+    """
+
+    response = session.get(
+        url,
+        timeout=REQUEST_TIMEOUT
+    )
+
+    # Explicit HTTP status-code handling.
+    response.raise_for_status()
+
+    return BeautifulSoup(
+        response.text,
+        "html.parser"
+    )
+
+
+# ============================================================
+# HELPER: NORMALIZE TEXT
+# ============================================================
+
+def clean_text(value: str) -> str:
+    """
+    Normalize whitespace in scraped text.
+    """
+
+    if value is None:
+        return ""
+
+    return " ".join(
+        value.split()
+    ).strip()
+
+
+# ============================================================
+# STAR RATING CONVERSION
+# ============================================================
+
+RATING_MAP = {
+    "One": 1,
+    "Two": 2,
+    "Three": 3,
+    "Four": 4,
+    "Five": 5
+}
+
+
+def parse_rating(rating_text: str):
+    """
+    Convert:
+        One   → 1
+        Two   → 2
+        ...
+        Five  → 5
+
+    Returns None if parsing fails.
+    """
+
+    rating_text = clean_text(
+        rating_text
+    )
+
+    return RATING_MAP.get(
+        rating_text
+    )
+
+
+# ============================================================
+# PRICE PARSING
+# ============================================================
+
+def parse_price(price_text: str):
+    """
+    Convert a price such as:
+
+        £51.77
+
+    into:
+
+        51.77
+    """
+
+    try:
+
+        cleaned = (
+            price_text
+            .replace("£", "")
+            .replace(",", "")
+            .strip()
+        )
+
+        return float(cleaned)
+
+    except (ValueError, TypeError):
+
+        return None
+
+
+# ============================================================
+# AVAILABILITY PARSING
+# ============================================================
+
+def parse_stock(availability_text: str):
+    """
+    Convert availability text into boolean.
+
+    Example:
+
+        "In stock (22 available)"
+            → True
+
+        "Out of stock"
+            → False
+
+    Returns None when the text is unexpected.
+    """
+
+    text = clean_text(
+        availability_text
+    ).lower()
+
+    if "in stock" in text:
+        return True
+
+    if "out of stock" in text:
+        return False
+
+    return None
+
+
+# ============================================================
+# GET CATEGORY LINKS
+# ============================================================
+
+def get_category_links():
+    """
+    Get category names and URLs from the Books to Scrape
+    homepage.
+
+    Returns at least three categories.
+    """
+
+    print("\n" + "=" * 70)
+    print("STEP 1 — DISCOVERING BOOK CATEGORIES")
+    print("=" * 70)
+
+    soup = fetch_page(
+        BASE_URL
+    )
+
+    category_links = []
+
+    # Books to Scrape places categories inside:
+    # .side_categories
+    category_list = soup.select(
+        ".side_categories ul li ul li a"
+    )
+
+    for link in category_list:
+
+        category_name = clean_text(
+            link.get_text()
+        )
+
+        href = link.get("href")
+
+        if not href:
+            continue
+
+        category_url = (
+            BASE_URL.rstrip("/")
+            + "/"
+            + href.lstrip("/")
+        )
+
+        category_links.append(
+            {
+                "category_name": category_name,
+                "category_url": category_url
+            }
+        )
+
+    if len(category_links) < TARGET_CATEGORY_COUNT:
+
+        raise RuntimeError(
+            "Could not discover at least "
+            f"{TARGET_CATEGORY_COUNT} categories."
+        )
+
+    selected_categories = category_links[
+        :TARGET_CATEGORY_COUNT
+    ]
+
+    for category in selected_categories:
+
+        print(
+            f"Category: {category['category_name']}"
+        )
+
+        print(
+            f"URL:      {category['category_url']}"
+        )
+
+    return selected_categories
+
+
+# ============================================================
+# SCRAPE ONE CATEGORY PAGE
+# ============================================================
+
+def scrape_category(
+    category_name: str,
+    category_url: str,
+    max_books: int = 20
+):
+    """
+    Scrape books from a category.
+
+    Pagination is followed until enough books have been
+    collected or the category has no next page.
+    """
+
+    books = []
+
+    current_url = category_url
+
+    while current_url and len(books) < max_books:
+
+        print(
+            f"  Scraping: {current_url}"
+        )
+
+        soup = fetch_page(
+            current_url
+        )
+
+        products = soup.select(
+            "article.product_pod"
+        )
+
+        if not products:
+
+            break
+
+        for product in products:
+
+            if len(books) >= max_books:
+                break
+
+            # ------------------------------------------------
+            # TITLE
+            # ------------------------------------------------
+
+            title_element = product.select_one(
+                "h3 a"
+            )
+
+            title = ""
+
+            if title_element:
+
+                title = clean_text(
+                    title_element.get("title")
+                    or title_element.get_text()
+                )
+
+            # ------------------------------------------------
+            # PRICE
+            # ------------------------------------------------
+
+            price_element = product.select_one(
+                ".price_color"
+            )
+
+            price_text = (
+                price_element.get_text()
+                if price_element
+                else ""
+            )
+
+            # ------------------------------------------------
+            # RATING
+            # ------------------------------------------------
+
+            rating_element = product.select_one(
+                "p.star-rating"
+            )
+
+            rating_text = ""
+
+            if rating_element:
+
+                classes = rating_element.get(
+                    "class",
+                    []
+                )
+
+                rating_classes = [
+                    item
+                    for item in classes
+                    if item != "star-rating"
+                ]
+
+                if rating_classes:
+
+                    rating_text = rating_classes[0]
+
+            # ------------------------------------------------
+            # AVAILABILITY
+            # ------------------------------------------------
+
+            availability_element = product.select_one(
+                ".availability"
+            )
+
+            availability_text = (
+                availability_element.get_text()
+                if availability_element
+                else ""
+            )
+
+            books.append(
+                {
+                    "title": title,
+                    "price_text": clean_text(
+                        price_text
+                    ),
+                    "star_rating": rating_text,
+                    "availability": clean_text(
+                        availability_text
+                    ),
+                    "category": category_name
+                }
+            )
+
+        # ----------------------------------------------------
+        # NEXT PAGE
+        # ----------------------------------------------------
+
+        next_button = soup.select_one(
+            "li.next a"
+        )
+
+        if next_button:
+
+            next_href = next_button.get(
+                "href"
+            )
+
+            if not next_href:
+                break
+
+            current_url = (
+                current_url.rsplit(
+                    "/",
+                    1
+                )[0]
+                + "/"
+                + next_href
+            )
+
+        else:
+
+            current_url = None
+
+        time.sleep(
+            REQUEST_DELAY
+        )
+
+    return books
+
+
+# ============================================================
+# SCRAPE ALL SELECTED CATEGORIES
+# ============================================================
+
+def scrape_all_categories():
+
+    categories = get_category_links()
+
+    all_books = []
+
+    print("\n" + "=" * 70)
+    print("STEP 2 — SCRAPING BOOK DATA")
+    print("=" * 70)
+
+    for category in categories:
+
+        category_books = scrape_category(
+            category_name=category[
+                "category_name"
+            ],
+            category_url=category[
+                "category_url"
+            ],
+            max_books=BOOKS_PER_CATEGORY
+        )
+
+        print(
+            f"  → Collected "
+            f"{len(category_books)} books"
+        )
+
+        all_books.extend(
+            category_books
+        )
+
+    print(
+        f"\nTotal raw books scraped: "
+        f"{len(all_books)}"
+    )
+
+    if len(all_books) < MINIMUM_BOOKS_REQUIRED:
+
+        raise RuntimeError(
+            f"Only {len(all_books)} books were scraped. "
+            f"The assignment requires at least "
+            f"{MINIMUM_BOOKS_REQUIRED}."
+        )
+
+    return all_books
+
+
+# ============================================================
+# CLEAN DATA
+# ============================================================
+
+def clean_dataset(raw_books):
+    """
+    Convert scraped strings into proper data types.
+
+    Numeric parsing failures are handled using median
+    imputation as required by the assignment.
+
+    Rows missing critical text fields are dropped.
+    """
+
+    print("\n" + "=" * 70)
+    print("STEP 3 — CLEANING DATA")
+    print("=" * 70)
+
+    df = pd.DataFrame(
+        raw_books
+    )
+
+    print(
+        f"Raw dataset shape: {df.shape}"
+    )
+
+    # --------------------------------------------------------
+    # Remove rows with missing critical fields.
+    # --------------------------------------------------------
+
+    before_drop = len(df)
+
+    df = df.dropna(
+        subset=[
+            "title",
+            "category"
+        ]
+    )
+
+    df = df[
+        (df["title"].astype(str).str.strip() != "")
+        &
+        (df["category"].astype(str).str.strip() != "")
+    ]
+
+    dropped_rows = (
+        before_drop - len(df)
+    )
+
+    print(
+        f"Rows dropped because of missing "
+        f"critical text fields: {dropped_rows}"
+    )
+
+    # --------------------------------------------------------
+    # PRICE
+    # --------------------------------------------------------
+
+    df["price_gbp"] = (
+        df["price_text"]
+        .apply(parse_price)
+    )
+
+    price_missing = (
+        df["price_gbp"]
+        .isna()
+        .sum()
+    )
+
+    if price_missing > 0:
+
+        median_price = (
+            df["price_gbp"]
+            .median()
+        )
+
+        df["price_gbp"] = (
+            df["price_gbp"]
+            .fillna(median_price)
+        )
+
+        print(
+            f"Price values imputed with median: "
+            f"{price_missing}"
+        )
+
+    # --------------------------------------------------------
+    # RATING
+    # --------------------------------------------------------
+
+    df["rating"] = (
+        df["star_rating"]
+        .apply(parse_rating)
+    )
+
+    rating_missing = (
+        df["rating"]
+        .isna()
+        .sum()
+    )
+
+    if rating_missing > 0:
+
+        median_rating = (
+            df["rating"]
+            .median()
+        )
+
+        df["rating"] = (
+            df["rating"]
+            .fillna(median_rating)
+            .round()
+            .astype(int)
+        )
+
+        print(
+            f"Rating values imputed with median: "
+            f"{rating_missing}"
+        )
+
+    # --------------------------------------------------------
+    # STOCK
+    # --------------------------------------------------------
+
+    df["in_stock"] = (
+        df["availability"]
+        .apply(parse_stock)
+    )
+
+    stock_missing = (
+        df["in_stock"]
+        .isna()
+        .sum()
+    )
+
+    if stock_missing > 0:
+
+        # Boolean fields cannot use numeric median.
+        # We use the modal value as the deterministic
+        # fallback for unexpected availability text.
+        mode = (
+            df["in_stock"]
+            .dropna()
+            .mode()
+        )
+
+        fallback = (
+            bool(mode.iloc[0])
+            if not mode.empty
+            else False
+        )
+
+        df["in_stock"] = (
+            df["in_stock"]
+            .fillna(fallback)
+            .astype(bool)
+        )
+
+        print(
+            f"Unexpected availability values "
+            f"handled using mode: {stock_missing}"
+        )
+
+    # --------------------------------------------------------
+    # FIXED GBP → INR CONVERSION
+    # --------------------------------------------------------
+
+    df["price_inr"] = (
+        df["price_gbp"]
+        * GBP_TO_INR
+    ).round(2)
+
+    # --------------------------------------------------------
+    # FINAL COLUMNS
+    # --------------------------------------------------------
+
+    df = df[
+        [
+            "title",
+            "price_gbp",
+            "price_inr",
+            "rating",
+            "in_stock",
+            "category"
+        ]
+    ]
+
+    # --------------------------------------------------------
+    # FORCE REQUIRED DATA TYPES
+    # --------------------------------------------------------
+
+    df["title"] = (
+        df["title"]
+        .astype(str)
+    )
+
+    df["price_gbp"] = (
+        pd.to_numeric(
+            df["price_gbp"],
+            errors="coerce"
+        )
+        .astype(float)
+    )
+
+    df["price_inr"] = (
+        pd.to_numeric(
+            df["price_inr"],
+            errors="coerce"
+        )
+        .astype(float)
+    )
+
+    df["rating"] = (
+        pd.to_numeric(
+            df["rating"],
+            errors="coerce"
+        )
+        .round()
+        .astype(int)
+    )
+
+    df["in_stock"] = (
+        df["in_stock"]
+        .astype(bool)
+    )
+
+    df["category"] = (
+        df["category"]
+        .astype(str)
+    )
+
+    # --------------------------------------------------------
+    # FINAL VALIDATION
+    # --------------------------------------------------------
+
+    if len(df) < MINIMUM_BOOKS_REQUIRED:
+
+        raise RuntimeError(
+            "Cleaning reduced the dataset below "
+            f"{MINIMUM_BOOKS_REQUIRED} rows."
+        )
+
+    if df["category"].nunique() < 3:
+
+        raise RuntimeError(
+            "Final dataset contains fewer than "
+            "3 categories."
+        )
+
+    print(
+        f"\nClean dataset shape: {df.shape}"
+    )
+
+    print(
+        f"Categories: "
+        f"{df['category'].nunique()}"
+    )
+
+    print("\nData types:")
+
+    print(
+        df.dtypes
+    )
+
+    return df
+
+
+# ============================================================
+# DATABASE CREATION
+# ============================================================
+
+def create_database(df):
+    """
+    Create a normalized SQLite database containing:
+
+        categories
+            ↓
+        books
+
+    categories.category_id
+            ↓
+        books.category_id
+    """
+
+    print("\n" + "=" * 70)
+    print("STEP 4 — CREATING SQLITE DATABASE")
+    print("=" * 70)
+
+    # Remove old database so every execution recreates it.
+    if DATABASE_PATH.exists():
+
+        DATABASE_PATH.unlink()
+
+    connection = sqlite3.connect(
+        DATABASE_PATH
+    )
+
+    try:
+
+        cursor = connection.cursor()
+
+        # ----------------------------------------------------
+        # Enable foreign keys
+        # ----------------------------------------------------
+
+        cursor.execute(
+            "PRAGMA foreign_keys = ON;"
+        )
+
+        # ----------------------------------------------------
+        # Categories table
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            CREATE TABLE categories (
+                category_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_name TEXT NOT NULL UNIQUE
+            );
+            """
+        )
+
+        # ----------------------------------------------------
+        # Books table
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            CREATE TABLE books (
+                book_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                price_gbp REAL NOT NULL,
+                price_inr REAL NOT NULL,
+                rating INTEGER NOT NULL
+                    CHECK(rating BETWEEN 1 AND 5),
+                in_stock INTEGER NOT NULL
+                    CHECK(in_stock IN (0, 1)),
+                category_id INTEGER NOT NULL,
+                FOREIGN KEY(category_id)
+                    REFERENCES categories(category_id)
+            );
+            """
+        )
+
+        # ----------------------------------------------------
+        # Insert categories
+        # ----------------------------------------------------
+
+        categories = sorted(
+            df["category"]
+            .unique()
+            .tolist()
+        )
+
+        cursor.executemany(
+            """
+            INSERT INTO categories(category_name)
+            VALUES (?);
+            """,
+            [
+                (category,)
+                for category in categories
+            ]
+        )
+
+        # ----------------------------------------------------
+        # Build category lookup
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            SELECT category_id, category_name
+            FROM categories;
+            """
+        )
+
+        category_lookup = {
+            row[1]: row[0]
+            for row in cursor.fetchall()
+        }
+
+        # ----------------------------------------------------
+        # Insert books
+        # ----------------------------------------------------
+
+        rows_to_insert = []
+
+        for _, row in df.iterrows():
+
+            cate
