@@ -1,0 +1,791 @@
+"""
+Zepto Support Assistant
+Module 3 - GenAI / RAG / LangGraph / FastAPI
+
+Graded baseline:
+    MOCK_LLM=1   or unset
+
+Optional real LLM:
+    MOCK_LLM=0
+    GROQ_API_KEY=<your-key>
+
+Run:
+    pip install -r requirements.txt
+    python main.py
+
+Then:
+    uvicorn main:app --reload
+
+API:
+    POST /ask
+    Body:
+        {"query": "What is Zepto's delivery policy?"}
+"""
+
+import os
+import json
+from pathlib import Path
+from typing import TypedDict, List, Literal
+
+import chromadb
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+from sentence_transformers import SentenceTransformer
+from langgraph.graph import StateGraph, START, END
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+DOCS_DIR = BASE_DIR / "docs"
+CHROMA_DIR = BASE_DIR / "chroma_db"
+
+COLLECTION_NAME = "zepto_policy_corpus"
+
+# MOCK_LLM defaults to enabled.
+MOCK_LLM = os.getenv("MOCK_LLM", "1") != "0"
+
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+
+
+# ============================================================
+# ZEpto DOCUMENT CORPUS
+# ============================================================
+
+DOCUMENTS = {
+    "doc_01": (
+        "Delivery Policy",
+        "Zepto delivers grocery and household essentials to serviceable pin codes "
+        "within 10 to 30 minutes of order confirmation, depending on the customer's "
+        "delivery zone and current order volume. Standard delivery is free on orders "
+        "over INR 149; orders below this threshold incur a flat INR 25 delivery fee. "
+        "Priority delivery, which reserves the next available rider slot, is "
+        "available at checkout for an additional INR 15. Zepto does not currently "
+        "deliver to addresses outside its listed serviceable pin codes."
+    ),
+
+    "doc_02": (
+        "Returns & Refunds",
+        "Grocery and perishable items may be reported for a return within 24 hours "
+        "of delivery if damaged, spoiled, or incorrect; non-perishable packaged "
+        "items may be returned within 7 days of delivery in unopened, resalable "
+        "condition. Approved refunds are credited to the original payment method "
+        "within 3–5 business days, or instantly to the Zepto wallet if the customer "
+        "opts for wallet credit. Personal care items that have been opened are "
+        "non-returnable except in the case of a manufacturing defect. Return pickup, "
+        "where required, is arranged free of cost by Zepto."
+    ),
+
+    "doc_03": (
+        "Membership Tiers",
+        "Zepto offers three account tiers: Basic (free, default tier, standard "
+        "delivery fees apply), Zepto Pass (INR 49 per month, free standard delivery "
+        "on all orders and 5% off select categories), and Zepto Pass+ (INR 99 per "
+        "month, free priority delivery, 10% off select categories, and early access "
+        "to limited-time deals 24 hours before they go live to Basic and Pass "
+        "members). Membership can be cancelled at any time from account settings; "
+        "cancelling stops the next billing cycle but does not refund the current "
+        "membership period."
+    ),
+
+    "doc_04": (
+        "Order Tracking",
+        "Every Zepto order shows a live rider-tracking map from the moment it is "
+        "packed until delivery, accessible from the 'Track Order' screen. Estimated "
+        "delivery time updates automatically as the rider moves. If an order's "
+        "status shows no movement for more than 20 minutes past its original "
+        "estimated delivery time, customers should contact support directly rather "
+        "than continue waiting, since this indicates a likely delivery issue."
+    ),
+
+    "doc_05": (
+        "Order Cancellation Policy",
+        "Orders can be cancelled free of cost any time before the order status "
+        "changes to 'Packed', typically within the first 2 minutes of placing the "
+        "order. Once an order has been packed, it can no longer be cancelled through "
+        "the app, since the rider is dispatched immediately after packing given "
+        "Zepto's quick-delivery model. If a packed order cannot be delivered due "
+        "to a Zepto-side issue (for example, rider unavailability), the order is "
+        "auto-cancelled and fully refunded without any cancellation fee."
+    ),
+
+    "doc_06": (
+        "Damaged or Missing Items",
+        "If an order arrives with damaged, spoiled, or missing items, customers "
+        "must report it within 24 hours of delivery through the 'Report an Issue' "
+        "button on the order page. Zepto ships a free replacement or issues a full "
+        "refund for damaged, spoiled, or missing items without requiring the "
+        "customer to return the original item, unless the order value exceeds "
+        "INR 1000, in which case a photo of the issue must be submitted through "
+        "the report form before a replacement or refund is processed."
+    ),
+
+    "doc_07": (
+        "Gift Cards",
+        "Zepto gift cards are available in fixed denominations of INR 100, "
+        "INR 250, INR 500, and INR 1000, and are delivered by email or SMS within "
+        "minutes of purchase. Gift cards are valid for 1 year from the date of "
+        "issue and carry no maintenance fees. Gift card balance can be combined "
+        "with one other payment method at checkout but cannot be combined with "
+        "another gift card in the same transaction. Gift card balance cannot be "
+        "redeemed for cash except where required by law."
+    ),
+
+    "doc_08": (
+        "Customer Support Hours",
+        "Zepto customer support is available via in-app chat 24 hours a day, "
+        "7 days a week, given the time-sensitive nature of quick commerce "
+        "deliveries. Average in-app chat response time is under 2 minutes. Email "
+        "support is also available for non-urgent queries and is answered within "
+        "24 hours on business days. Phone support is not offered."
+    ),
+}
+
+
+# ============================================================
+# CREATE DOCUMENT FILES
+# ============================================================
+
+def create_document_files():
+    """
+    Creates the required 8 corpus documents exactly from DOCUMENTS.
+    """
+
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+
+    for doc_id, (title, content) in DOCUMENTS.items():
+
+        file_path = DOCS_DIR / f"{doc_id}.txt"
+
+        # Exact requested corpus text:
+        file_path.write_text(content, encoding="utf-8")
+
+
+# ============================================================
+# EMBEDDING MODEL
+# ============================================================
+
+print("\nLoading embedding model...")
+print(f"Model: {EMBEDDING_MODEL_NAME}")
+
+embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+
+# ============================================================
+# CHROMADB
+# ============================================================
+
+print("Initializing ChromaDB...")
+
+chroma_client = chromadb.PersistentClient(
+    path=str(CHROMA_DIR)
+)
+
+collection = chroma_client.get_or_create_collection(
+    name=COLLECTION_NAME,
+    metadata={
+        "hnsw:space": "cosine"
+    }
+)
+
+
+# ============================================================
+# INGESTION + EMBEDDING
+# ============================================================
+
+def ingest_documents():
+    """
+    Loads all documents, performs simple per-document chunking,
+    creates embeddings and stores them in ChromaDB.
+    """
+
+    create_document_files()
+
+    existing = collection.get()
+
+    existing_ids = set(existing.get("ids", []))
+
+    ids = []
+    documents = []
+    metadatas = []
+
+    for doc_id, (title, content) in DOCUMENTS.items():
+
+        chunk_id = f"{doc_id}_chunk_01"
+
+        if chunk_id in existing_ids:
+            continue
+
+        ids.append(chunk_id)
+        documents.append(content)
+
+        metadatas.append({
+            "document_id": doc_id,
+            "title": title,
+            "chunk_id": chunk_id,
+            "source": f"{doc_id}.txt"
+        })
+
+    if not ids:
+        print("All documents already exist in ChromaDB.")
+        return
+
+    print(f"Embedding {len(documents)} chunks...")
+
+    embeddings = embedding_model.encode(
+        documents,
+        normalize_embeddings=True
+    ).tolist()
+
+    collection.add(
+        ids=ids,
+        documents=documents,
+        metadatas=metadatas,
+        embeddings=embeddings
+    )
+
+    print(f"Inserted {len(ids)} chunks into ChromaDB.")
+
+
+# ============================================================
+# QUERY EMBEDDING + RETRIEVAL
+# ============================================================
+
+def retrieve_documents(query: str, top_k: int = 3):
+    """
+    Embeds the query locally and retrieves top-k chunks
+    from ChromaDB using cosine similarity.
+    """
+
+    query_embedding = embedding_model.encode(
+        [query],
+        normalize_embeddings=True
+    ).tolist()[0]
+
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        include=[
+            "documents",
+            "metadatas",
+            "distances"
+        ]
+    )
+
+    retrieved = []
+
+    result_documents = results.get("documents", [[]])[0]
+    result_metadatas = results.get("metadatas", [[]])[0]
+    result_distances = results.get("distances", [[]])[0]
+
+    for document, metadata, distance in zip(
+        result_documents,
+        result_metadatas,
+        result_distances
+    ):
+
+        retrieved.append({
+            "content": document,
+            "metadata": metadata,
+            "distance": distance
+        })
+
+    return retrieved
+
+
+# ============================================================
+# STRUCTURED PROMPT TEMPLATE
+# ============================================================
+
+STRUCTURED_PROMPT = """
+ROLE:
+You are Zepto's policy support assistant.
+Answer customer questions using only the provided Zepto policy context.
+
+CONTEXT:
+The following documents were retrieved from Zepto's policy corpus:
+
+{context}
+
+TASK:
+Answer the customer's question accurately and concisely.
+Use the retrieved policy information as the factual basis for your answer.
+
+FORMAT:
+Return a JSON object with exactly these fields:
+{
+  "answer": "string",
+  "sources": ["chunk/document IDs"],
+  "confidence": 0.0
+}
+
+LENGTH:
+Keep the answer concise and normally within 2-5 sentences.
+
+NEGATIVE CONSTRAINT:
+Do not answer using information that is not present in the provided context.
+Do not invent policies, prices, timelines, fees, guarantees, or procedures.
+If the context does not contain enough information to answer the question,
+state that the available policy context does not provide enough information.
+
+FEW-SHOT EXAMPLE:
+
+Question:
+"What is the delivery fee for an order below INR 149?"
+
+Context:
+"Standard delivery is free on orders over INR 149; orders below this
+threshold incur a flat INR 25 delivery fee."
+
+Expected response:
+{
+  "answer": "Orders below INR 149 incur a flat INR 25 standard delivery fee.",
+  "sources": ["doc_01_chunk_01"],
+  "confidence": 1.0
+}
+
+Now answer the following customer question using only the supplied context.
+
+Customer question:
+{query}
+"""
+
+
+# ============================================================
+# PYDANTIC RESPONSE SCHEMA
+# ============================================================
+
+class SupportResponse(BaseModel):
+    answer: str
+    sources: List[str]
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0
+    )
+
+
+class AskRequest(BaseModel):
+    query: str
+
+
+# ============================================================
+# LANGGRAPH STATE
+# ============================================================
+
+class SupportState(TypedDict, total=False):
+
+    query: str
+
+    intent: Literal[
+        "policy_question",
+        "general_question"
+    ]
+
+    retrieved_chunks: list
+
+    answer: str
+
+    sources: List[str]
+
+    confidence: float
+
+    final_response: dict
+
+
+# ============================================================
+# OPTIONAL REAL LLM
+# ============================================================
+
+def call_real_llm(prompt: str) -> str:
+    """
+    Optional MOCK_LLM=0 implementation.
+
+    Uses Groq through the OpenAI-compatible API.
+
+    Required environment variable:
+        GROQ_API_KEY
+
+    Optional:
+        GROQ_MODEL
+    """
+
+    try:
+        from groq import Groq
+
+    except ImportError:
+        raise RuntimeError(
+            "groq package is required when MOCK_LLM=0. "
+            "Install it using: pip install groq"
+        )
+
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "MOCK_LLM=0 requires GROQ_API_KEY."
+        )
+
+    client = Groq(api_key=api_key)
+
+    model = os.getenv(
+        "GROQ_MODEL",
+        "llama-3.1-8b-instant"
+    )
+
+    response = client.chat.completions.create(
+        model=model,
+        temperature=0,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    )
+
+    return response.choices[0].message.content
+
+
+# ============================================================
+# INTENT CLASSIFICATION
+# ============================================================
+
+POLICY_KEYWORDS = [
+    "delivery",
+    "return",
+    "refund",
+    "membership",
+    "tracking",
+    "cancel",
+    "gift card",
+    "support hours"
+]
+
+
+def classify_intent_mock(query: str) -> str:
+    """
+    Required deterministic grading logic.
+    """
+
+    query_lower = query.lower()
+
+    for keyword in POLICY_KEYWORDS:
+
+        if keyword in query_lower:
+            return "policy_question"
+
+    return "general_question"
+
+
+def classify_intent_real(query: str) -> str:
+    """
+    Optional real LLM classification.
+    """
+
+    prompt = f"""
+Classify the following customer query into exactly one category:
+
+policy_question
+general_question
+
+Use policy_question when the query is about Zepto policies,
+delivery, returns, refunds, membership, tracking, cancellation,
+gift cards, or support.
+
+Use general_question otherwise.
+
+Return only one of:
+policy_question
+general_question
+
+Query:
+{query}
+"""
+
+    raw = call_real_llm(prompt).strip().lower()
+
+    if "policy_question" in raw:
+        return "policy_question"
+
+    return "general_question"
+
+
+# ============================================================
+# LANGGRAPH NODE 1
+# classify_intent
+# ============================================================
+
+def classify_intent(state: SupportState) -> SupportState:
+
+    query = state["query"]
+
+    if MOCK_LLM:
+
+        intent = classify_intent_mock(query)
+
+    else:
+
+        intent = classify_intent_real(query)
+
+    return {
+        **state,
+        "intent": intent
+    }
+
+
+# ============================================================
+# LANGGRAPH NODE 2
+# retrieve_and_answer
+# ============================================================
+
+def retrieve_and_answer(state: SupportState) -> SupportState:
+
+    query = state["query"]
+
+    # Retrieval ALWAYS happens.
+    retrieved = retrieve_documents(
+        query=query,
+        top_k=3
+    )
+
+    if not retrieved:
+
+        return {
+            **state,
+            "retrieved_chunks": [],
+            "answer": "No relevant policy context was retrieved.",
+            "sources": [],
+            "confidence": 0.0
+        }
+
+    top_chunk = retrieved[0]
+
+    sources = [
+        item["metadata"]["chunk_id"]
+        for item in retrieved
+    ]
+
+    # --------------------------------------------------------
+    # REQUIRED MOCK PATH
+    # --------------------------------------------------------
+
+    if MOCK_LLM:
+
+        snippet = top_chunk["content"][:200].strip()
+
+        answer = (
+            f"Based on the retrieved context: {snippet}"
+        )
+
+        return {
+            **state,
+            "retrieved_chunks": retrieved,
+            "answer": answer,
+            "sources": sources,
+            "confidence": 1.0
+        }
+
+    # --------------------------------------------------------
+    # OPTIONAL REAL LLM PATH
+    # --------------------------------------------------------
+
+    context_parts = []
+
+    for item in retrieved:
+
+        context_parts.append(
+            f"""
+Chunk ID: {item['metadata']['chunk_id']}
+Document: {item['metadata']['document_id']}
+Title: {item['metadata']['title']}
+
+Content:
+{item['content']}
+"""
+        )
+
+    context = "\n".join(context_parts)
+
+    prompt = STRUCTURED_PROMPT.format(
+        context=context,
+        query=query
+    )
+
+    raw_output = None
+
+    # Initial attempt + 2 corrective retries
+    for attempt in range(3):
+
+        if attempt == 0:
+
+            current_prompt = prompt
+
+        else:
+
+            current_prompt = f"""
+Your previous response failed JSON schema validation.
+
+Return ONLY valid JSON using exactly this schema:
+
+{{
+  "answer": "string",
+  "sources": ["string"],
+  "confidence": 0.0
+}}
+
+Do not include Markdown.
+Do not include ```json.
+Do not add commentary.
+
+The response must use only the supplied context.
+
+Original prompt:
+{prompt}
+"""
+
+        try:
+
+            raw_output = call_real_llm(
+                current_prompt
+            )
+
+            parsed = json.loads(raw_output)
+
+            validated = SupportResponse.model_validate(
+                parsed
+            )
+
+            return {
+                **state,
+                "retrieved_chunks": retrieved,
+                "answer": validated.answer,
+                "sources": validated.sources,
+                "confidence": validated.confidence
+            }
+
+        except Exception as exc:
+
+            if attempt == 2:
+
+                return {
+                    **state,
+                    "retrieved_chunks": retrieved,
+                    "answer": (
+                        "ERROR: The LLM response failed "
+                        "structured-output validation after "
+                        "three attempts."
+                    ),
+                    "sources": sources,
+                    "confidence": 0.0
+                }
+
+    return state
+
+
+# ============================================================
+# LANGGRAPH NODE 3
+# direct_answer
+# ============================================================
+
+def direct_answer(state: SupportState) -> SupportState:
+
+    query = state["query"]
+
+    # --------------------------------------------------------
+    # REQUIRED MOCK PATH
+    # --------------------------------------------------------
+
+    if MOCK_LLM:
+
+        answer = (
+            "I can only answer questions about Zepto policies right now."
+        )
+
+        return {
+            **state,
+            "answer": answer,
+            "sources": [],
+            "confidence": 1.0
+        }
+
+    # --------------------------------------------------------
+    # OPTIONAL REAL LLM PATH
+    # --------------------------------------------------------
+
+    prompt = f"""
+ROLE:
+You are Zepto's customer support assistant.
+
+CONTEXT:
+No Zepto policy retrieval was required for this question.
+
+TASK:
+Answer the customer's general question.
+
+FORMAT:
+Return valid JSON with:
+{{
+  "answer": "string",
+  "sources": [],
+  "confidence": 0.0
+}}
+
+LENGTH:
+Keep the answer concise.
+
+NEGATIVE CONSTRAINT:
+Do not invent Zepto-specific policies.
+If the question requires Zepto policy information,
+say that you can only answer using available Zepto policies.
+
+FEW-SHOT EXAMPLE:
+
+Question:
+"Who invented Python?"
+
+Expected response:
+{{
+  "answer": "Python was created by Guido van Rossum.",
+  "sources": [],
+  "confidence": 1.0
+}}
+
+Customer question:
+{query}
+"""
+
+    for attempt in range(3):
+
+        if attempt == 0:
+
+            current_prompt = prompt
+
+        else:
+
+            current_prompt = f"""
+Return ONLY valid JSON.
+
+Required schema:
+
+{{
+  "answer": "string",
+  "sources": [],
+  "confidence": 0.0
+}}
+
+Do not use Markdown.
+Do not include commentary.
+
+Original prompt:
+{prompt}
+"""
+
+        try:
+
+            raw_output = call_real_llm(
+                current_prompt
+            )
+
+            parse
